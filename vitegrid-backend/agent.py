@@ -9,7 +9,7 @@ import uuid
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Union, get_args, get_origin, Dict, Optional
+from typing import Any, Literal, Union, get_args, get_origin, Dict, Optional, List, Tuple
 
 import time
 
@@ -19,6 +19,9 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field, model_validator
+
+# Import structural-relative coordinate space transformation layer
+from coordinate_transforms import StructuralRelativeTracker
 
 # ---------------------------------------------------------------------------
 # Algorithmic Interdiction: Deterministic Masking Pipeline
@@ -1145,14 +1148,149 @@ def auto_layout(layout: DocumentLayout) -> DocumentLayout:
     return layout
 
 
+# ---------------------------------------------------------------------------
+# Finite State Machine Orchestration: Localized Token-Level Remediation Loop
+# ---------------------------------------------------------------------------
+def execute_remediation_fsm_loop(
+    user_goal: str, 
+    initial_layout: DocumentLayout, 
+    pdf_path: Path, 
+    docling_json_tmp: Path,
+    max_attempts: int = 3
+) -> DocumentLayout:
+    """Orchestrates a Finite State Machine to repair localized structural text drops asynchronously.
+    
+    Bypasses whole-document rejection cycles by isolating macro omissions to individual node scopes.
+    """
+    from verify_text_loss import verify_document_text_loss, tokenize_document
+    
+    current_layout = copy.deepcopy(initial_layout)
+    tracker = StructuralRelativeTracker(
+        page_width_px=current_layout.page_width_px, 
+        page_height_px=current_layout.page_height_px
+    )
+    
+    for attempt in range(max_attempts):
+        print(f"[FSM State 1] Executing structural token alignment validation. Attempt {attempt + 1}")
+        
+        compiled_text_blocks = []
+        node_boundaries: List[Tuple[str, int, int]] = []
+        current_token_cursor = 0
+        
+        for block in current_layout.blocks:
+            block_content = ""
+            if block.text:
+                block_content = block.text
+            elif block.items:
+                block_content = "\n".join(block.items)
+            elif block.rows:
+                block_content = "\n".join([" | ".join(row) for row in block.rows])
+                
+            tokens = tokenize_document(block_content)
+            start_pos = current_token_cursor
+            end_pos = start_pos + len(tokens)
+            
+            node_boundaries.append((block.id, start_pos, end_pos))
+            tracker.register_node(block.id, start_pos, end_pos)
+            compiled_text_blocks.append(block_content)
+            current_token_cursor = end_pos
+
+        audit_results = verify_document_text_loss(str(pdf_path), str(docling_json_tmp))
+        
+        if audit_results["status"] == "pass" and len(audit_results.get("structural_failures", [])) == 0:
+            print("[FSM State 4] Document structure validated successfully. Proceeding to compilation.")
+            return auto_layout(current_layout)
+            
+        print(f"[FSM State 2] Structural drop detected. Failures: {len(audit_results.get('structural_failures', []))}")
+        
+        for failure in audit_results.get("structural_failures", []):
+            failing_idx = failure["token_index"]
+            target_block_id = None
+            
+            for block_id, start, end in node_boundaries:
+                if start <= failing_idx < end:
+                    target_block_id = block_id
+                    break
+                    
+            if not target_block_id:
+                target_block_id = current_layout.blocks[-1].id
+
+            print(f"[FSM State 2] Isolated failure at index {failing_idx} to Node structural block: {target_block_id}")
+            
+            target_block = next((b for b in current_layout.blocks if b.id == target_block_id), None)
+            if not target_block:
+                continue
+
+            print(f"[FSM State 3] Dispatching localized sub-prompt to repair structural container {target_block_id}")
+            repair_prompt = f"""
+            You are processing an isolated text recovery block for a document layout engine.
+            The structural block with ID '{target_block_id}' was flagged for omitting a procedural marker sequence.
+            
+            Context of target structural field:
+            - Structural Node Type: {target_block.type.value}
+            - Current Flagged Text Segment: {target_block.text or target_block.items}
+            - Expected missing anchor pattern: {failure['token']}
+            
+            CRITICAL DIRECTIVE: Regenerate the text payload for this isolated block. You MUST force inclusion of the missing marker sequence.
+            Do not summarize, do not trim whitespace boundaries, and do not append conversational greetings.
+            Return results formatted inside a valid JSON DocumentBlock structure matching the type '{target_block.type.value}'.
+            """
+            
+            try:
+                config = _json_config(DocumentBlock)
+                config.temperature = 0.0  # Force greedy decoding parameters
+                
+                response = _call_with_retry(
+                    _core_client(),
+                    model=_generation_model(),
+                    contents=[repair_prompt, f"User Goal Constraints:\n{user_goal}"],
+                    config=config
+                )
+                
+                repaired_block: DocumentBlock = _parse_response(response, DocumentBlock)
+                
+                if repaired_block:
+                    print(f"[FSM State 4] Splicing verified text token segments back into context tree for {target_block_id}")
+                    
+                    if target_block.type == BlockType.LIST and repaired_block.items:
+                        target_block.items = repaired_block.items
+                        new_token_count = len(tokenize_document("\n".join(repaired_block.items)))
+                    elif target_block.type == BlockType.TABLE and repaired_block.rows:
+                        target_block.rows = repaired_block.rows
+                        target_block.table_cells = repaired_block.table_cells
+                        new_token_count = len(tokenize_document("\n".join([" | ".join(r) for r in repaired_block.rows])))
+                    else:
+                        target_block.text = repaired_block.text
+                        new_token_count = len(tokenize_document(repaired_block.text or ""))
+                    
+                    tracker.handle_sequence_mutation(target_block_id, new_token_count)
+                    
+            except Exception as err:
+                print(f"[FSM Error] Localized recovery exception encountered on node {target_block_id}: {err}")
+                continue
+
+    print("[FSM Warning] Reached maximum allowed stabilization cycles. Splicing default fallback containers.")
+    return auto_layout(current_layout)
+
+
 def generate_from_prompt(user_goal: str, max_retries: int = 1) -> tuple[DocumentLayout, AuditReport]:
     layout = auto_layout(agent3_generate_from_prompt(user_goal))
+    
+    # Dynamic link mapping to track temporary extraction runs
+    tmp_pdf_stub = Path("layouts/tmp_render.pdf")
+    tmp_json_stub = Path("layouts/tmp_docling.json")
+    
+    if tmp_pdf_stub.exists() and tmp_json_stub.exists():
+        layout = execute_remediation_fsm_loop(user_goal, layout, tmp_pdf_stub, tmp_json_stub, max_attempts=max_retries + 1)
+        
     report = _combined_audit({"user_goal": user_goal}, layout)
     attempts = 0
     while not report.approved and attempts < max_retries:
         layout = auto_layout(
             agent3_generate_from_prompt(user_goal, patch_directive=report.patch_instructions)
         )
+        if tmp_pdf_stub.exists() and tmp_json_stub.exists():
+            layout = execute_remediation_fsm_loop(user_goal, layout, tmp_pdf_stub, tmp_json_stub, max_attempts=1)
         report = _combined_audit({"user_goal": user_goal}, layout)
         attempts += 1
     return layout, report

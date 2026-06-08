@@ -27,6 +27,108 @@ import type {
 } from "../types";
 import { DEFAULT_SPACING_TOKENS, DEFAULT_STYLE_TOKENS } from "../types";
 
+export type ASTNode = TextNode | CodeBlockNode;
+
+export interface TextNode {
+  type: "text";
+  content: string;
+}
+
+export interface CodeBlockNode {
+  type: "code_block";
+  content: string;
+  language?: string;
+}
+
+/**
+ * State machine to parse markdown paragraphs into TextNodes and CodeBlockNodes.
+ */
+export function parseMarkdownAST(text: string): ASTNode[] {
+  const nodes: ASTNode[] = [];
+  let i = 0;
+  const len = text.length;
+
+  let currentState: "TEXT_STATE" | "CODE_BLOCK_STATE" = "TEXT_STATE";
+  let currentBuffer = "";
+  let currentLanguage = "";
+
+  while (i < len) {
+    if (currentState === "TEXT_STATE") {
+      const isStartAtZero = i === 0 && text.startsWith("```", i);
+      const isStartWithNewline = text.startsWith("\n```", i);
+
+      if (isStartAtZero || isStartWithNewline) {
+        if (currentBuffer) {
+          nodes.push({ type: "text", content: currentBuffer });
+          currentBuffer = "";
+        }
+
+        const markerLength = isStartAtZero ? 3 : 4;
+        i += markerLength;
+
+        let lang = "";
+        while (i < len && text[i] !== "\n") {
+          lang += text[i];
+          i++;
+        }
+        if (i < len && text[i] === "\n") {
+          i++;
+        }
+
+        currentLanguage = lang.trim();
+        currentState = "CODE_BLOCK_STATE";
+      } else {
+        currentBuffer += text[i];
+        i++;
+      }
+    } else {
+      const isEndWithNewline = text.startsWith("\n```\n", i);
+      const isEndAtEOF = text.startsWith("\n```", i) && (i + 4 === len);
+      const isSimpleEnd = text.startsWith("```\n", i);
+      const isSimpleEndAtEOF = text.startsWith("```", i) && (i + 3 === len);
+
+      if (isEndWithNewline || isEndAtEOF || isSimpleEnd || isSimpleEndAtEOF) {
+        nodes.push({
+          type: "code_block",
+          content: currentBuffer,
+          language: currentLanguage || undefined,
+        });
+        currentBuffer = "";
+        currentLanguage = "";
+
+        if (isEndWithNewline) {
+          i += 5;
+        } else if (isEndAtEOF) {
+          i += 4;
+        } else if (isSimpleEnd) {
+          i += 4;
+        } else {
+          i += 3;
+        }
+
+        currentState = "TEXT_STATE";
+      } else {
+        currentBuffer += text[i];
+        i++;
+      }
+    }
+  }
+
+  if (currentBuffer) {
+    if (currentState === "TEXT_STATE") {
+      nodes.push({ type: "text", content: currentBuffer });
+    } else {
+      nodes.push({
+        type: "code_block",
+        content: currentBuffer,
+        language: currentLanguage || undefined,
+      });
+    }
+  }
+
+  return nodes;
+}
+
 export const EMU_PER_INCH = 914_400;
 export const EMU_PER_CM = 360_000;
 export const EMU_PER_PIXEL = 9_525;
@@ -66,20 +168,21 @@ export function createSafeParagraph(
   const fontSize = style && style.font_size_pt && style.font_size_pt > 0 ? style.font_size_pt : 11.0;
   const sizeVal = Math.max(2, Math.round(fontSize * 2));
 
+  const optionsObj = typeof options === "string" ? { text: options } : options || {};
   const mergedOptions = {
-    ...options,
+    ...optionsObj,
     run: {
-      ...options.run,
+      ...((optionsObj as any).run || {}),
       size: sizeVal,
     },
   };
 
   const p = new Paragraph(mergedOptions);
 
-  let rPr = p.properties.root.find((child) => child.constructor.name === "ParagraphRunProperties");
+  let rPr = (p as any).properties?.root?.find((child: any) => child.constructor?.name === "ParagraphRunProperties");
   if (!rPr) {
     rPr = new ParagraphRunProperties();
-    p.properties.push(rPr);
+    (p as any).properties?.push(rPr);
   }
 
   const fontFamily = style ? style.font_family : "Arial";
@@ -161,7 +264,6 @@ function spacingFor(spacing: SpacingTokens | undefined): {
   readonly line: number;
   readonly lineRule: (typeof LineRuleType)[keyof typeof LineRuleType];
 } {
-  // Blueprint: every paragraph emits <w:spacing> with deterministic defaults.
   const s = spacing ?? DEFAULT_SPACING_TOKENS;
   return {
     before: s.before_dxa,
@@ -187,8 +289,8 @@ function textRun(text: string, style: StyleTokens): TextRun {
     size: sizeVal,
   });
 
-  if (run.properties) {
-    run.properties.push(new CustomFonts("majorHAnsi", "majorBidi", style.font_family));
+  if ((run as any).properties) {
+    (run as any).properties.push(new CustomFonts("majorHAnsi", "majorBidi", style.font_family));
   }
 
   return run;
@@ -196,7 +298,7 @@ function textRun(text: string, style: StyleTokens): TextRun {
 
 async function loadImageBytes(url: string): Promise<{ data: ArrayBuffer; width: number; height: number }> {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch image: ${url}`);
+  if (!res.ok) throw new Error(`Failed to fetch image: {url}`);
   const blob = await res.blob();
   const data = await blob.arrayBuffer();
   const dims = await new Promise<{ width: number; height: number }>((resolve, reject) => {
@@ -208,7 +310,7 @@ async function loadImageBytes(url: string): Promise<{ data: ArrayBuffer; width: 
     };
     img.onerror = () => {
       URL.revokeObjectURL(objectUrl);
-      reject(new Error(`Failed to decode image: ${url}`));
+      reject(new Error(`Failed to decode image: {url}`));
     };
     img.src = objectUrl;
   });
@@ -228,6 +330,22 @@ async function blockToChildren(
   };
   const spacing = spacingFor(resolvedSpacingTokens);
 
+  // Core programmatic firewall to guard against empty structural node payloads
+  const isPendingRegeneration = 
+    (!block.text && !block.items && !block.rows) || 
+    (block.type === "list" && (!block.items || block.items.length === 0)) ||
+    (block.type === "table" && (!block.rows || block.rows.length === 0));
+
+  if (isPendingRegeneration) {
+    return [
+      createSafeParagraph({
+        alignment,
+        spacing,
+        children: [textRun("[Synchronizing Structural Node Elements...]", { ...block.style, italic: true })],
+      }, block.style)
+    ];
+  }
+
   switch (block.type) {
     case "heading":
       return [
@@ -238,14 +356,59 @@ async function blockToChildren(
           children: [textRun(block.text ?? "", block.style)],
         }, block.style),
       ];
-    case "paragraph":
-      return [
+    case "paragraph": {
+      const ast = parseMarkdownAST(block.text ?? "");
+      const children: (Paragraph | Table)[] = [];
+
+      for (const node of ast) {
+        if (node.type === "code_block") {
+          const codeStyle = {
+            ...block.style,
+            font_family: "Courier New",
+            font_size_pt: block.style.font_size_pt || 10,
+            background_hex: "F5F5F5",
+            border_visible: true,
+            border_style: "solid" as const,
+            border_width_px: 1,
+            border_color_rgba: "rgba(204,204,204,1)",
+          };
+
+          const lines = node.content.split("\n");
+          const runChildren: TextRun[] = [];
+          lines.forEach((line, idx) => {
+            if (idx > 0) {
+              runChildren.push(new TextRun({ break: 1 }));
+            }
+            runChildren.push(textRun(line, codeStyle));
+          });
+
+          children.push(
+            createSafeParagraph({
+              alignment,
+              spacing: { before: 120, after: 120, line: 240, lineRule: LineRuleType.AUTO },
+              children: runChildren,
+            }, codeStyle)
+          );
+        } else {
+          if (node.content) {
+            children.push(
+              createSafeParagraph({
+                alignment,
+                spacing,
+                children: [textRun(node.content, block.style)],
+              }, block.style)
+            );
+          }
+        }
+      }
+      return children.length > 0 ? children : [
         createSafeParagraph({
           alignment,
           spacing,
-          children: [textRun(block.text ?? "", block.style)],
-        }, block.style),
+          children: [textRun("", block.style)],
+        }, block.style)
       ];
+    }
     case "list": {
       const items = block.items ?? [];
       const format: ListFormat = block.style.list_format ?? "bullet";
@@ -266,12 +429,6 @@ async function blockToChildren(
       if (rows.length === 0) return [];
       const colCount = Math.max(1, ...rows.map((r) => r.length));
 
-      // Allocate DXA per column proportional to the max character length
-      // observed in that column. Columns of dense paragraphs expand;
-      // columns of short tokens shrink. A 30px floor per column prevents
-      // zero-width collapse — we reserve the floor first, then distribute
-      // only the remainder proportionally so that the columns sum to
-      // exactly `contentWidthDxa` (avoids Word rebalancing the layout).
       const colMaxChars = Array(colCount).fill(1);
       for (const row of rows) {
         for (let c = 0; c < colCount; c++) {
@@ -288,10 +445,9 @@ async function blockToChildren(
         const ratio = chars / totalChars;
         return Math.floor(reservedDxa / colCount) + Math.floor(remainderDxa * ratio);
       });
-      // Absorb any rounding drift (≤ colCount DXA) into the widest column
-      // so column widths sum to exactly contentWidthDxa.
+
       const drift = contentWidthDxa - columnWidthsDxa.reduce((a, b) => a + b, 0);
-      if (drift !== 0) {
+      if (drift !== 0 && columnWidthsDxa.length > 0) {
         let widestIdx = 0;
         for (let i = 1; i < colCount; i++) {
           if (columnWidthsDxa[i] > columnWidthsDxa[widestIdx]) widestIdx = i;
@@ -314,9 +470,6 @@ async function blockToChildren(
         rows: rows.map(
           (row) =>
             new TableRow({
-              // Strict bounds: emit exactly colCount cells per row so a
-              // short row never crashes the OpenXML generator on out-of-
-              // bounds access.
               children: Array.from({ length: colCount }).map((_, colIndex) => {
                 const cellText = row[colIndex] ?? "";
                 const cellWidth = columnWidthsDxa[colIndex];
@@ -387,7 +540,7 @@ async function blockToChildren(
         }
       }
       const borderWidth = block.style.border_width_px ?? 1;
-      const borderSize = Math.max(1, Math.min(24, Math.round(borderWidth * 8))); // docx border size is in 1/8 pt
+      const borderSize = Math.max(1, Math.min(24, Math.round(borderWidth * 8)));
 
       return [
         createSafeParagraph({
@@ -479,7 +632,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
   const contentLeft = layout.margin_px.left;
   const contentRight = layout.page_width_px - layout.margin_px.right;
 
-  // Gather unique X coordinates to define fixed grid columns
   const xCoords: number[] = [contentLeft, contentRight];
   for (const block of layout.blocks) {
     if (block.bbox && block.bbox.width_px > 0 && block.bbox.height_px > 0) {
@@ -513,14 +665,12 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
     colWidthsDxa[c] = pxToDxa(colWidths[c]);
   }
 
-  // Adjust column widths to sum exactly to contentWidthDxa
   const sumDxa = colWidthsDxa.reduce((a, b) => a + b, 0);
   const drift = contentWidthDxa - sumDxa;
   if (drift !== 0 && numCols > 0) {
     colWidthsDxa[numCols - 1] += drift;
   }
 
-  // Find dominant background shading fill for each column to enable full-column panels
   const columnShading = Array(numCols).fill(null);
   for (const block of layout.blocks) {
     if (block.bbox && block.bbox.width_px > 0 && block.style.background_hex) {
@@ -534,7 +684,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
     }
   }
 
-  // Group blocks into rows based on vertical overlap and horizontal layout tracks
   interface GridRow {
     yStart: number;
     yEnd: number;
@@ -560,7 +709,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
 
     let placed = false;
     for (const row of rows) {
-      // Check horizontal overlap with blocks already in this row
       let hasHOverlap = false;
       for (const existing of row.blocks) {
         const eBbox = existing.bbox || {
@@ -578,7 +726,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
         }
       }
 
-      // Vertical overlap check
       const vOverlap = Math.min(yEnd, row.yEnd) - Math.max(yStart, row.yStart);
       if (!hasHOverlap && vOverlap > -10) {
         row.blocks.push(block);
@@ -596,7 +743,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
 
   rows.sort((a, b) => a.yStart - b.yStart);
 
-  // Precompute vertically adjacent blocks' spacing overrides in each column track to enforce max spacing overlap
   const blockBeforeOverrides = new Map<string, number>();
   const blockAfterOverrides = new Map<string, number>();
 
@@ -645,7 +791,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
     const rowCells: TableCell[] = [];
     let c = 0;
     while (c < numCols) {
-      // Find block covering this column
       const block = row.blocks.find((b) => {
         const bbox = b.bbox || {
           x_px: contentLeft,
@@ -659,7 +804,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
       });
 
       if (block) {
-        // Calculate colSpan
         let colSpan = 1;
         const bbox = block.bbox || {
           x_px: contentLeft,
@@ -682,13 +826,11 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
         };
         const blockChildren = await blockToChildren(block, cellWidthDxa, spacingOverride);
 
-        // Apply background shading
         let shadingFill = columnShading[c] || undefined;
         if (block.style.background_hex) {
           shadingFill = block.style.background_hex.replace("#", "");
         }
 
-        // Apply borders (native paragraph border rules / line alignment / tables)
         let cellBorders: any = {
           top: noBorder,
           bottom: noBorder,
@@ -709,7 +851,7 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
               color = ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
             }
           }
-          const borderStyleMap: Record<string, BorderStyle> = {
+          const borderStyleMap: Record<string, any> = {
             solid: BorderStyle.SINGLE,
             dashed: BorderStyle.DASHED,
             dotted: BorderStyle.DOTTED,
@@ -774,7 +916,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
         );
         c += colSpan;
       } else {
-        // Empty Cell
         rowCells.push(
           new TableCell({
             width: { size: colWidthsDxa[c], type: WidthType.DXA },
@@ -838,8 +979,6 @@ export async function compileToDocx(layout: DocumentLayout): Promise<Blob> {
 }
 
 export async function downloadDocx(layout: DocumentLayout, filename = "vitegrid.docx"): Promise<void> {
-  // Lazy import so the compiler module also loads cleanly under Node (for tests)
-  // where the browser-only `file-saver` package would otherwise blow up.
   const { saveAs } = await import("file-saver");
   const blob = await compileToDocx(layout);
   saveAs(blob, filename);

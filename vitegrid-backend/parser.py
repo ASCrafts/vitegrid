@@ -5,10 +5,16 @@ import re
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+if TYPE_CHECKING:
+    from docling.document_converter import DocumentConverter
 
 import pymupdf
-from docling.document_converter import DocumentConverter
+import logging
+try:
+    from docling.document_converter import DocumentConverter
+except Exception:
+    DocumentConverter = None
 from docx import Document as DocxDocument
 from docx.shared import RGBColor
 
@@ -185,12 +191,14 @@ def augment_extraction_with_ocr(extraction: PdfExtraction) -> PdfExtraction:
     return extraction
 
 
-_converter: DocumentConverter | None = None
+_converter: Any = None
 
 
-def _get_converter() -> DocumentConverter:
+def _get_converter() -> Any:
     global _converter
     if _converter is None:
+        if DocumentConverter is None:
+            raise ImportError("docling is not installed or could not be loaded on this system.")
         _converter = DocumentConverter()
     return _converter
 
@@ -199,6 +207,30 @@ def parse_document(file_path: str | Path) -> ParsedDocument:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"Source file not found: {path}")
+
+    # --- STAGE 1: Algorithmic Triage ---
+    try:
+        from triage import AlgorithmicTriage, TriageStatus
+        logger = logging.getLogger(__name__)
+        
+        if path.suffix.lower() in {".pdf", ".epub", ".xps", ".cbz", ".mobi", ".fb2"}:
+            triage = AlgorithmicTriage(str(path))
+            status = triage.execute()
+            
+            if status == TriageStatus.GARBLED:
+                logger.error(f"Aborting parse for {path.name}: Document is corrupted (CID errors/TOFU).")
+                return ParsedDocument(
+                    markdown="[Error: Document contains unreadable corrupted text streams.]", 
+                    tables=[], 
+                    images=[], 
+                    page_count=0, 
+                    raw={"status": "garbled", "error": "cid_corruption"}
+                )
+            elif status == TriageStatus.SCANNED:
+                logger.info(f"Document {path.name} detected as scanned image via triage.")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Triage check failed or missing: {e}. Proceeding to standard extraction.")
+    # -----------------------------------
 
     result = _get_converter().convert(str(path))
     doc = result.document
@@ -280,6 +312,28 @@ def extract_pdf_layout(
     path = Path(pdf_path)
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
+
+    triage_scanned = False
+
+    # --- STAGE 1: Triage Check ---
+    try:
+        from triage import AlgorithmicTriage, TriageStatus
+        logger = logging.getLogger(__name__)
+        
+        triage = AlgorithmicTriage(str(path))
+        status = triage.execute()
+        
+        if status == TriageStatus.GARBLED:
+            logger.warning(f"Layout extraction aborted: {path.name} is corrupted.")
+            return PdfExtraction(pages=[], is_scanned=False)
+            
+        if status == TriageStatus.SCANNED:
+            logger.info(f"Document {path.name} is a scan. Layout extraction will be minimal.")
+            triage_scanned = True
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Triage check failed or missing: {e}")
+    # --------------------------------
+
     doc = pymupdf.open(str(path))
     pages: list[PageLayout] = []
     total_chars = 0
@@ -341,7 +395,7 @@ def extract_pdf_layout(
             )
         )
     doc.close()
-    is_scanned = total_chars < 20
+    is_scanned = triage_scanned or (total_chars < 20)
     return PdfExtraction(pages=pages, is_scanned=is_scanned)
 
 

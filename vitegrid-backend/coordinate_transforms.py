@@ -1,16 +1,100 @@
 """
-Coordinate Projection Transforms
+Coordinate Projection Transforms & Structural-Relative Node Tracking
 
-Bidirectional mapping between three coordinate spaces:
+Manages bidirectional mapping and structural stabilization between three coordinate spaces:
 1. PDF space: Absolute unrotated page pixels (0,0 = bottom-left, Y increases upward)
 2. VLM space: Normalized integer [0-1000]² representing virtual canvas (0,0 = top-left)
 3. CSS space: Physical pixels in web viewport (0,0 = top-left)
 
-References: High-Fidelity Document Reconstruction specification
+References: High-Fidelity Document Reconstruction specification, Phase 3 Spatiotemporal Alignment
 """
 
-from typing import Tuple
+from typing import Tuple, Dict, Any, Optional, List
+from dataclasses import dataclass
 import math
+
+
+@dataclass
+class StructuralNodeInterval:
+    """Represents a genomic-style zero-based, half-open interval for a document node."""
+    node_id: str
+    start_token_idx: int
+    end_token_idx: int
+    
+    def contains_index(self, idx: int) -> bool:
+        # Zero-based, half-open interval logic: inclusive of start, exclusive of end
+        return self.start_token_idx <= idx < self.end_token_idx
+
+    def shift_interval(self, offset: int) -> None:
+        """Adjusts boundaries cleanly to isolate upstream sequence mutations."""
+        self.start_token_idx += offset
+        self.end_token_idx += offset
+
+
+class StructuralRelativeTracker:
+    """
+    Firewalls Layout Space from token modifications by mapping physical canvas 
+    coordinates directly to discrete structural node identifiers rather than volatile string indices.
+    """
+    def __init__(self, page_width_px: float = 816.0, page_height_px: float = 1056.0):
+        self.page_width_px = page_width_px
+        self.page_height_px = page_height_px
+        self.registry: Dict[str, StructuralNodeInterval] = {}
+        self.node_order: List[str] = []
+
+    def register_node(self, node_id: str, start_idx: int, end_idx: int) -> None:
+        """Maps an immutable Node ID to a zero-based half-open text interval."""
+        interval = StructuralNodeInterval(node_id, start_idx, end_idx)
+        self.registry[node_id] = interval
+        if node_id not in self.node_order:
+            self.node_order.append(node_id)
+
+    def handle_sequence_mutation(self, failing_node_id: str, new_length: int) -> None:
+        """
+        Adjusts subsequent tracking intervals when a localized node updates its content length,
+        permanently preventing downstream index shifting and layout corruption.
+        """
+        if failing_node_id not in self.registry:
+            return
+            
+        current_interval = self.registry[failing_node_id]
+        old_length = current_interval.end_token_idx - current_interval.start_token_idx
+        delta = new_length - old_length
+        
+        # Update target node boundary
+        current_interval.end_token_idx = current_interval.start_token_idx + new_length
+        
+        # Cascade transformation shift exclusively to downstream nodes
+        start_shifting = False
+        for node_id in self.node_order:
+            if start_shifting:
+                self.registry[node_id].shift_interval(delta)
+            if node_id == failing_node_id:
+                start_shifting = True
+
+
+def apply_affine_projection(
+    bbox_coords: Tuple[float, float, float, float], 
+    scale_x: float, 
+    scale_y: float, 
+    translation_vector: Tuple[float, float]
+) -> Tuple[float, float, float, float]:
+    """
+    Executes a 2D affine transformation matrix over matched node coordinates 
+    to convert structural geometries smoothly into final layout canvases.
+    
+    [x_new]   [scale_x     0    ] [x_old]   [trans_x]
+    [y_new] = [   0     scale_y ] [y_old] + [trans_y]
+    """
+    x0, y0, x1, y1 = bbox_coords
+    tx, ty = translation_vector
+    
+    x0_new = (x0 * scale_x) + tx
+    y0_new = (y0 * scale_y) + ty
+    x1_new = (x1 * scale_x) + tx
+    y1_new = (y1 * scale_y) + ty
+    
+    return x0_new, y0_new, x1_new, y1_new
 
 
 def pdf_to_vlm_coords(

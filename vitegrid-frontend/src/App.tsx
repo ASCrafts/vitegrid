@@ -10,6 +10,8 @@ import { TextEditor } from "./components/TextEditor";
 import { editorReducer, initEditorState } from "./state/history";
 import type { AuditReport, DocumentBlock, DocumentLayout, GenerateResponse } from "./types";
 import { downloadDocx } from "./utils/wordCompiler";
+import { sanitizeText, sanitizeLayout } from "./utils/wordValidation";
+
 
 interface Workspace {
   layout: DocumentLayout;
@@ -80,7 +82,7 @@ export default function App() {
       const summary = JSON.parse(e.data);
       setOptimizationStatus(`100% Convergence Target Reached in ${summary.total_iterations} adjustments.`);
       if (summary.final_layout) {
-        dispatch({ type: "replace", layout: summary.final_layout });
+        dispatch({ type: "replace", layout: sanitizeLayout(summary.final_layout) });
       }
       eventSource.close();
     });
@@ -117,21 +119,40 @@ export default function App() {
       preview = raw.startsWith("/") ? raw : `/${raw.replace(/^\.\//, "")}`;
     }
     setWorkspace({
-      layout: result.layout,
+      layout: sanitizeLayout(result.layout),
       audit: result.audit,
       sourcePreview: preview,
     });
   };
 
   const handleBlocksChange = (next: DocumentBlock[]) => {
-    dispatch({ type: "commit", next });
+    const sanitizedNext = next.map(block => {
+      const sanitizedBlock = { ...block };
+      if (typeof block.text === "string") {
+        sanitizedBlock.text = sanitizeText(block.text);
+      }
+      if (block.items) {
+        sanitizedBlock.items = block.items.map(sanitizeText);
+      }
+      if (block.rows) {
+        sanitizedBlock.rows = block.rows.map(row => row.map(sanitizeText));
+      }
+      if (block.table_cells) {
+        sanitizedBlock.table_cells = block.table_cells.map(row =>
+          row.map(cell => ({ ...cell, text: sanitizeText(cell.text) }))
+        );
+      }
+      return sanitizedBlock;
+    });
+    dispatch({ type: "commit", next: sanitizedNext });
   };
 
   const handleLayoutFromChat = (next: DocumentLayout) => {
+    const sanitizedNext = sanitizeLayout(next);
     if (workspace) {
-      setWorkspace({ ...workspace, layout: next });
+      setWorkspace({ ...workspace, layout: sanitizedNext });
     }
-    dispatch({ type: "commit", next: next.blocks });
+    dispatch({ type: "commit", next: sanitizedNext.blocks });
   };
 
   const handleExport = async () => {

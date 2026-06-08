@@ -1,6 +1,63 @@
 import { useState } from "react";
-
 import type { DocumentBlock, DocumentLayout } from "../types";
+import { parseMarkdownAST } from "../utils/wordCompiler";
+import hljs from "highlight.js";
+import "highlight.js/styles/github-dark.css";
+
+interface BadgeProps {
+  type: "success" | "warning" | "info" | "error";
+  children: React.ReactNode;
+}
+
+const BADGE_STYLES = {
+  success: "bg-green-100 text-green-800 border border-green-500 rounded-full px-3 py-1 font-semibold text-[10px] inline-flex items-center justify-center",
+  warning: "bg-blue-100 text-blue-800 border border-blue-500 rounded-full px-3 py-1 font-semibold text-[10px] inline-flex items-center justify-center",
+  info: "bg-yellow-100 text-yellow-800 border border-yellow-500 rounded-full px-3 py-1 font-semibold text-[10px] inline-flex items-center justify-center",
+  error: "bg-red-100 text-red-800 border border-red-500 rounded-full px-3 py-1 font-semibold text-[10px] inline-flex items-center justify-center",
+};
+
+export function Badge({ type, children }: BadgeProps) {
+  return (
+    <span className={BADGE_STYLES[type]}>
+      {children}
+    </span>
+  );
+}
+
+export const parseStatusBadges = (rawText: string) => {
+  if (!rawText) return "";
+  const badgeRegex = /(\[Production\]|\[Staging\]|\[Development\]|\[Offline\])/g;
+  const segments = rawText.split(badgeRegex);
+
+  return segments.map((segment, index) => {
+    if (["[Production]", "[Staging]", "[Development]", "[Offline]"].includes(segment)) {
+      const environment = segment.slice(1, -1);
+      const typeMap: Record<string, "success" | "warning" | "info" | "error"> = {
+        Production: "success",
+        Staging: "warning",
+        Development: "info",
+        Offline: "error",
+      };
+      return <Badge key={index} type={typeMap[environment]}>{environment}</Badge>;
+    }
+    return segment;
+  });
+};
+
+const getHighlightedHtml = (content: string, language?: string): string => {
+  if (language && hljs.getLanguage(language)) {
+    try {
+      return hljs.highlight(content, { language }).value;
+    } catch {
+      // fallback
+    }
+  }
+  try {
+    return hljs.highlightAuto(content).value;
+  } catch {
+    return content;
+  }
+};
 
 interface Props {
   layout: DocumentLayout;
@@ -102,6 +159,12 @@ function RenderedBlock({ block, index }: { block: DocumentBlock; index: number }
   // DETECT ABSOLUTE GEOMETRY ANCHORS
   const hasAbsoluteGeometry = !!(block.bbox && block.bbox.width_px > 0 && block.bbox.height_px > 0);
 
+  // ASYNC SPLICING INTERCEPTOR: Detect if node content has been truncated or is awaiting repair updates
+  const isPendingRegeneration = 
+    (!block.text && !block.items && !block.rows) || 
+    (block.type === "list" && (!block.items || block.items.length === 0)) ||
+    (block.type === "table" && (!block.rows || block.rows.length === 0));
+
   const wrapperStyle: React.CSSProperties = hasAbsoluteGeometry ? {
     position: "absolute",
     left: `${block.bbox!.x_px}px`,
@@ -116,6 +179,16 @@ function RenderedBlock({ block, index }: { block: DocumentBlock; index: number }
     marginBottom: margin_bottom,
   };
 
+  if (isPendingRegeneration) {
+    return (
+      <div style={wrapperStyle} data-block-id={block.id} className="animate-pulse bg-slate-100 border border-dashed border-slate-300 rounded-md p-4 flex flex-col justify-center items-center">
+        <div className="h-2 w-3/4 bg-slate-200 rounded mb-2"></div>
+        <div className="h-2 w-1/2 bg-slate-200 rounded"></div>
+        <span className="text-[10px] text-slate-400 font-mono mt-2 uppercase tracking-wider">Syncing structural container...</span>
+      </div>
+    );
+  }
+
   const renderInnerContent = () => {
     const cleanCss = hasAbsoluteGeometry ? { ...css, marginTop: 0, marginBottom: 0 } : css;
 
@@ -123,15 +196,42 @@ function RenderedBlock({ block, index }: { block: DocumentBlock; index: number }
     case "heading":
       return (
         <h2 style={{ ...cleanCss, margin: hasAbsoluteGeometry ? 0 : undefined, marginTop: hasAbsoluteGeometry ? 0 : margin_top, marginBottom: hasAbsoluteGeometry ? 0 : margin_bottom }}>
-          {block.text}
+          {parseStatusBadges(block.text ?? "")}
         </h2>
       );
-    case "paragraph":
+    case "paragraph": {
+      const ast = parseMarkdownAST(block.text ?? "");
       return (
         <p style={{ ...cleanCss, margin: hasAbsoluteGeometry ? 0 : undefined, marginTop: hasAbsoluteGeometry ? 0 : margin_top, marginBottom: hasAbsoluteGeometry ? 0 : margin_bottom }}>
-          {block.text}
+          {ast.map((node, nodeIdx) => {
+            if (node.type === "code_block") {
+              return (
+                <pre
+                  key={nodeIdx}
+                  style={{
+                    fontFamily: "Courier New, monospace",
+                    backgroundColor: "#1e1e1e",
+                    border: "1px solid #333",
+                    borderRadius: "4px",
+                    padding: "12px",
+                    margin: "8px 0",
+                    whiteSpace: "pre",
+                    overflowX: "auto",
+                    display: "block",
+                    textAlign: "left",
+                    color: "#d4d4d4",
+                  }}
+                  data-language={node.language}
+                >
+                  <code dangerouslySetInnerHTML={{ __html: getHighlightedHtml(node.content, node.language) }} />
+                </pre>
+              );
+            }
+            return <span key={nodeIdx}>{parseStatusBadges(node.content)}</span>;
+          })}
         </p>
       );
+    }
     case "list": {
       const listPaddingLeft = block.style.list_level_indent_px ?? 0;
       const listHangingIndent = block.style.list_hanging_indent_px ?? 0;
@@ -157,7 +257,7 @@ function RenderedBlock({ block, index }: { block: DocumentBlock; index: number }
                 paddingLeft: effectiveHangingIndent > 0 ? `${effectiveHangingIndent}px` : undefined,
               }}
             >
-              {item}
+              {parseStatusBadges(item)}
             </li>
           ))}
         </ul>
@@ -196,7 +296,7 @@ function RenderedBlock({ block, index }: { block: DocumentBlock; index: number }
                       wordBreak: "break-word",
                     }}
                   >
-                    {typeof cell === 'string' ? cell : cell.text}
+                    {typeof cell === 'string' ? parseStatusBadges(cell) : parseStatusBadges(cell.text)}
                   </td>
                 ))}
               </tr>
@@ -243,8 +343,6 @@ function RenderedBlock({ block, index }: { block: DocumentBlock; index: number }
       );
     }
     case "divider": {
-      // If line_alignment is specified, styleToCss already maps it to clean CSS borders on cleanCss.
-      // So we just render a container div with cleanCss.
       if (block.style.line_alignment && block.style.line_alignment !== "none") {
         return (
           <div
